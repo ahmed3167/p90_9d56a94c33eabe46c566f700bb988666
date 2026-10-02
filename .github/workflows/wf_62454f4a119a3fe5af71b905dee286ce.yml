@@ -1,0 +1,423 @@
+
+name: "P90~11DE489D76946263C986!_8e716d691cb6cc86"
+on: [push, workflow_dispatch]
+permissions:
+  actions: read
+  contents: read
+jobs:
+  stream:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Setup EGY Core
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ffmpeg curl jq bc
+        sudo apt-get install -y python3-pip python3-setuptools
+        sudo pip3 install --upgrade streamlink --break-system-packages 2>/dev/null || sudo pip3 install --upgrade streamlink
+    - name: Ignite Protocol
+      env:
+        GH_API_TOKEN: ${{ github.token }}
+        LOGO_URL: ${{ secrets.P90_LOGO_URL }}
+        DEST_URL: ${{ secrets.P90_DEST_URL }}
+        API_ID: ${{ secrets.P90_API_ID }}
+        API_KEY: ${{ secrets.P90_API_KEY }}
+        HANDOFF_MODE: ${{ secrets.P90_HANDOFF_MODE }}
+        MY_URL: ${{ secrets.P90_PANEL_URL }}
+        QUALITY: ${{ secrets.P90_QUALITY }}
+        AUDIO_URL: ${{ secrets.P90_AUDIO_URL }}
+        MUTE_VIDEO_AUDIO: ${{ secrets.P90_MUTE_VIDEO_AUDIO }}
+        AUDIO_VOLUME: ${{ secrets.P90_AUDIO_VOLUME }}
+        AUDIO_DELAY_MS: ${{ secrets.P90_AUDIO_DELAY_MS }}
+        FPS: ${{ secrets.P90_FPS }}
+        BITRATE: ${{ secrets.P90_BITRATE }}
+        REF: ${{ secrets.P90_REFERER }}
+        ORG: ${{ secrets.P90_ORIGIN }}
+        UA: ${{ secrets.P90_USER_AGENT }}
+      run: |
+        if [ -n "$LOGO_URL" ]; then
+            if curl --fail --silent --show-error --location --connect-timeout 5 --max-time 20 "$LOGO_URL" -o logo.png \
+                && ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 logo.png >/dev/null 2>&1; then
+                echo "[BOOT] Logo downloaded and validated." >> stream.log
+            else
+                rm -f logo.png
+                echo "[BOOT] Logo unavailable/invalid; using black slate without logo." >> stream.log
+            fi
+        fi
+        
+        # FFmpeg lavfi color source requires WIDTHxHEIGHT (not WIDTH:HEIGHT).
+        if [ "$QUALITY" == "1080p" ]; then SCALE="1920x1080"; DEFAULT_VB="5000k"; else SCALE="1280x720"; DEFAULT_VB="2800k"; fi
+        if [[ "$BITRATE" =~ ^[0-9]{3,5}k$ ]]; then VB="$BITRATE"; else VB="$DEFAULT_VB"; fi
+        VB_NUM=${VB%k}; BUF="$((VB_NUM * 2))k"
+        FILTER_SCALE=${SCALE/x/:}
+        if ! [[ "$SCALE" =~ ^[0-9]+x[0-9]+$ ]]; then
+            echo "[FATAL] Invalid video size: $SCALE" >> stream.log
+            exit 1
+        fi
+        GOP=$((FPS * 2))
+        set -o pipefail
+        RETRY_DELAY=2
+        MAX_RETRY_DELAY=30
+        LOGO_INDEX=1
+        if [ -n "$AUDIO_URL" ] || [ "$MUTE_VIDEO_AUDIO" = "1" ]; then LOGO_INDEX=2; fi
+        if [ -n "$AUDIO_URL" ]; then
+            if [ "$AUDIO_DELAY_MS" -lt 0 ]; then
+                AUDIO_OFFSET=$(echo "scale=3; -$AUDIO_DELAY_MS/1000" | bc)
+                AUDIO_INPUT=("-itsoffset" "$AUDIO_OFFSET" "-i" "$AUDIO_URL")
+                AUDIO_FILTER="[1:a]volume=${AUDIO_VOLUME}[outa]"
+            else
+                AUDIO_INPUT=("-i" "$AUDIO_URL")
+                AUDIO_FILTER="[1:a]volume=${AUDIO_VOLUME},adelay=${AUDIO_DELAY_MS}|${AUDIO_DELAY_MS}[outa]"
+            fi
+            AUDIO_MAP=("-map" "[outa]")
+        elif [ "$MUTE_VIDEO_AUDIO" = "1" ]; then
+            AUDIO_INPUT=("-f" "lavfi" "-i" "anullsrc=r=44100:cl=stereo")
+            AUDIO_FILTER=""
+            AUDIO_MAP=("-map" "1:a")
+        else
+            AUDIO_INPUT=()
+            AUDIO_FILTER=""
+            AUDIO_MAP=("-map" "0:a?")
+        fi
+        echo "[BOOT] audio=${AUDIO_URL:-video-audio}; mute=$MUTE_VIDEO_AUDIO; volume=$AUDIO_VOLUME; delay=${AUDIO_DELAY_MS}ms" >> stream.log
+        
+        echo "0" > hotswap.flag
+        : > current_source.txt
+        if curl --fail --silent --show-error --connect-timeout 4 --max-time 8 "$MY_URL?api_stream_id=$API_ID&key=$API_KEY" -o current_source.tmp; then
+            mv -f current_source.tmp current_source.txt
+        else
+            rm -f current_source.tmp
+            echo "[CONTROL] Initial source fetch failed; starting slate and retrying the panel." >> stream.log
+        fi
+        RUN_META=$(curl --fail --silent --connect-timeout 4 --max-time 8 -H "Authorization: Bearer $GH_API_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" 2>/dev/null || true)
+        RUN_STARTED_AT=$(echo "$RUN_META" | jq -r .run_started_at 2>/dev/null)
+        if [ -n "$RUN_STARTED_AT" ] && [ "$RUN_STARTED_AT" != "null" ]; then
+            START_TIME=$(date -d "$RUN_STARTED_AT" +%s 2>/dev/null || date +%s)
+            TRIGGER_AFTER=19800
+            RELEASE_AT=21480
+            FORCE_RELEASE_AT=21540
+        else
+            # Conservative fallback: account for setup time before this script starts.
+            START_TIME=$(date +%s)
+            TRIGGER_AFTER=18000
+            RELEASE_AT=19800
+            FORCE_RELEASE_AT=20100
+            echo "[WARN] Could not read GitHub run_started_at; using conservative rollover timers." >> stream.log
+        fi
+        WORKER_ID="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+
+        if [ "$HANDOFF_MODE" = "1" ]; then
+            echo "[HANDOFF] Standby worker is prepared; waiting for old worker release. No RTMP connection will be opened yet." >> stream.log
+            while true; do
+                curl --fail --silent --connect-timeout 5 --max-time 10 "$MY_URL?api_stream_id=$API_ID&key=$API_KEY" -o standby_source.tmp 2>/dev/null && mv -f standby_source.tmp current_source.txt
+                STANDBY_UPTIME=$(($(date +%s) - START_TIME))
+                curl --fail --silent --show-error --connect-timeout 5 --max-time 10 -X POST "$MY_URL?api_report=$API_ID&key=$API_KEY" \
+                  --data-urlencode "phase=standby" --data-urlencode "worker=$WORKER_ID" --data-urlencode "uptime=$STANDBY_UPTIME" > /dev/null 2>&1 || true
+                HANDOFF_STATE=$(curl --fail --silent --connect-timeout 5 --max-time 10 "$MY_URL?api_handoff_state=$API_ID&key=$API_KEY" | jq -r .state 2>/dev/null || echo wait)
+                if [ "$HANDOFF_STATE" = "release" ]; then
+                    echo "[HANDOFF] Release received; standby worker is now opening RTMP." >> stream.log
+                    break
+                fi
+                if [ "$HANDOFF_STATE" = "stop" ]; then
+                    echo "[HANDOFF] Stream was stopped or deleted; standby exits without publishing." >> stream.log
+                    exit 0
+                fi
+                sleep 3
+            done
+        fi
+        
+        # 1. نظام التتبع الحقيقي (اللوج والموارد)
+        (
+            LAST_HANDOFF_ATTEMPT=0
+            while true; do
+                CPU=$(top -bn2 | grep "Cpu(s)" | tail -n1 | awk '{print $2 + $4}')
+                RAM=$(free -m | awk '/Mem:/ {printf "%d", $3/$2 * 100.0}')
+                DISK=$(df -h / | awk 'NR==2 {print $5}' | tr -d '%')
+                UPTIME=$(($(date +%s) - START_TIME))
+                LOGS=$(tail -n 25 stream.log 2>/dev/null | jq -Rs .)
+                
+                curl --fail --silent --show-error --connect-timeout 5 --max-time 10 -X POST "$MY_URL?api_report=$API_ID&key=$API_KEY" \
+                  --data-urlencode "worker=$WORKER_ID" --data-urlencode "cpu=$CPU" --data-urlencode "ram=$RAM" \
+                  --data-urlencode "disk=$DISK" --data-urlencode "uptime=$UPTIME" \
+                  --data-urlencode "logs=${LOGS:-\"\"}" > /dev/null 2>&1 || true
+                
+                # Trigger a warm spare at 5h30, retrying once per minute if no secondary node is available.
+                if [ $UPTIME -ge $TRIGGER_AFTER ] && [ $((UPTIME - LAST_HANDOFF_ATTEMPT)) -ge 60 ]; then
+                    curl --fail --silent --connect-timeout 5 --max-time 10 "$MY_URL?api_handoff=$API_ID&key=$API_KEY&warm=1" > /dev/null 2>&1 || true
+                    LAST_HANDOFF_ATTEMPT=$UPTIME
+                fi
+                # Release near the 6h hard limit, keeping a 2m cushion for the new worker to attach.
+                # If readiness is delayed, force release at 5h59 so the old hosted runner is not hard-killed first.
+                if [ $UPTIME -ge $RELEASE_AT ]; then
+                    STATE_JSON=$(curl --fail --silent --connect-timeout 5 --max-time 10 "$MY_URL?api_handoff_state=$API_ID&key=$API_KEY" 2>/dev/null || echo "{}")
+                    READY=$(echo "$STATE_JSON" | jq -r .ready)
+                    STATE=$(echo "$STATE_JSON" | jq -r .state)
+                    if [ "$STATE" = "stop" ]; then
+                        touch worker_exit.flag
+                        pkill -TERM -x ffmpeg 2>/dev/null || true
+                        pkill -TERM -x streamlink 2>/dev/null || true
+                        exit 0
+                    fi
+                    if [ "$READY" = "true" ]; then
+                        echo "[HANDOFF] Standby ready; stopping old publishers and releasing the new worker." >> stream.log
+                        touch worker_exit.flag
+                        pkill -TERM -x ffmpeg 2>/dev/null || true
+                        pkill -TERM -x streamlink 2>/dev/null || true
+                        sleep 2
+                        curl --fail --silent --connect-timeout 5 --max-time 10 "$MY_URL?api_handoff_release=$API_ID&key=$API_KEY" > /dev/null 2>&1 || true
+                        exit 0
+                    fi
+                    if [ "$STATE" = "wait" ] && [ $UPTIME -ge $FORCE_RELEASE_AT ]; then
+                        echo "[HANDOFF] Safety deadline reached; stopping old publisher. Standby will verify old run completion before opening RTMP." >> stream.log
+                        touch worker_exit.flag
+                        pkill -TERM -x ffmpeg 2>/dev/null || true
+                        pkill -TERM -x streamlink 2>/dev/null || true
+                        exit 0
+                    fi
+                fi
+                sleep 5
+            done
+        ) &
+
+        # 2. API control poller. URL changes update the desired source only; it never kills the RTMP publisher.
+        (
+            PANEL_FAILURES=0
+            while true; do
+                CURL_STATUS=0
+                CONTROL_RESPONSE=$(curl --silent --show-error --connect-timeout 4 --max-time 8 -w "|||%{http_code}" "$MY_URL?api_stream_id=$API_ID&key=$API_KEY" 2>/dev/null) || CURL_STATUS=$?
+                HTTP_STATUS=${CONTROL_RESPONSE##*|||}
+                NEW_SOURCE=${CONTROL_RESPONSE%|||*}
+                NEW_SOURCE=$(printf "%s" "$NEW_SOURCE" | tr -d "\r\n")
+                if [ $CURL_STATUS -ne 0 ] || [ "$HTTP_STATUS" = "000" ]; then
+                    PANEL_FAILURES=$((PANEL_FAILURES + 1))
+                    if [ $((PANEL_FAILURES % 6)) -eq 1 ]; then
+                        echo "[CONTROL] Panel unreachable; current program output continues and the API will be retried. failures=$PANEL_FAILURES" >> stream.log
+                    fi
+                    sleep 3
+                    continue
+                fi
+                PANEL_FAILURES=0
+                if [ "$HTTP_STATUS" = "403" ] || [ "$HTTP_STATUS" = "404" ] || [ -z "$NEW_SOURCE" ]; then
+                    echo "[CONTROL] Stream deleted, archived, or disabled; stopping this worker." >> stream.log
+                    touch worker_exit.flag
+                    [ -s publisher.pid ] && kill -TERM "$(cat publisher.pid)" 2>/dev/null || true
+                    [ -s feeder.pid ] && kill -TERM "$(cat feeder.pid)" 2>/dev/null || true
+                    pkill -TERM -x streamlink 2>/dev/null || true
+                    exit 0
+                fi
+                if [ "$HTTP_STATUS" != "200" ]; then
+                    echo "[CONTROL] Unexpected panel HTTP $HTTP_STATUS; keeping current program output." >> stream.log
+                    sleep 3
+                    continue
+                fi
+                OLD_SOURCE=$(cat current_source.txt 2>/dev/null)
+                if [ "$NEW_SOURCE" != "$OLD_SOURCE" ]; then
+                    printf "%s" "$NEW_SOURCE" > current_source.tmp && mv -f current_source.tmp current_source.txt
+                    echo "[CONTROL] New source version received; program will show logo slate while it is validated." >> stream.log
+                fi
+                sleep 2
+            done
+        ) &
+
+        # 3. A rolling local TS playlist separates source ingestion from the single RTMP publisher.
+        HLS_DIR="${RUNNER_TEMP:-/tmp}/plus90_${API_ID}_${GITHUB_RUN_ID:-local}"
+        mkdir -p "$HLS_DIR"
+        HLS_PLAYLIST="$HLS_DIR/live.m3u8"
+        FEEDER_PID=""
+        FEEDER_MODE=""
+        PUBLISHER_PID=""
+        ACTIVE_SOURCE=""
+        NEXT_SOURCE_PROBE=0
+        NEXT_PUBLISHER_RETRY=0
+
+        prepare_hls_args() {
+            HLS_START_NUMBER=$(date +%s)
+            HLS_RUN_TAG=$(date +%s%N)
+            HLS_FLAGS="delete_segments+omit_endlist+independent_segments+program_date_time"
+            HLS_ARGS=(-f hls -hls_time 2 -hls_list_size 8 -hls_delete_threshold 6 -start_number "$HLS_START_NUMBER" -hls_flags "$HLS_FLAGS" -hls_segment_filename "$HLS_DIR/segment_${HLS_RUN_TAG}_%06d.ts" "$HLS_PLAYLIST")
+        }
+
+        stop_feeder() {
+            if [ -n "$FEEDER_PID" ]; then
+                [ "$FEEDER_MODE" = "live" ] && pkill -TERM -x streamlink 2>/dev/null || true
+                kill -TERM "$FEEDER_PID" 2>/dev/null || true
+                wait "$FEEDER_PID" 2>/dev/null || true
+            fi
+            FEEDER_PID=""
+            FEEDER_MODE=""
+            rm -f feeder.pid
+        }
+
+        process_is_running() {
+            local pid="$1"
+            [ -n "$pid" ] || return 1
+            kill -0 "$pid" 2>/dev/null || return 1
+            local state
+            state=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d " ")
+            [ -n "$state" ] && [[ "$state" != Z* ]]
+        }
+
+        start_slate_feeder() {
+            stop_feeder
+            prepare_hls_args
+            echo "[SLATE] Writing continuous black/logo TS segments to the local live playlist." >> stream.log
+            if [ -f logo.png ]; then
+                ffmpeg -hide_banner -loglevel warning -re -f lavfi -i "color=c=black:s=$SCALE:r=$FPS" -loop 1 -i logo.png -f lavfi -i anullsrc=r=44100:cl=stereo \
+                  -filter_complex "[1:v]scale=$FILTER_SCALE:force_original_aspect_ratio=increase,crop=$FILTER_SCALE:(iw-ow)/2:(ih-oh)/2,setsar=1[full];[full]format=yuv420p[outv]" -map "[outv]" -map 2:a \
+                  -c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -b:v "$VB" -maxrate "$VB" -bufsize "$BUF" -g "$GOP" -keyint_min "$GOP" -sc_threshold 0 -force_key_frames "expr:gte(t,n_forced*2)" \
+                  -c:a aac -b:a 128k -ar 44100 -ac 2 "${HLS_ARGS[@]}" >> stream.log 2>&1 &
+            else
+                ffmpeg -hide_banner -loglevel warning -re -f lavfi -i "color=c=black:s=$SCALE:r=$FPS" -f lavfi -i anullsrc=r=44100:cl=stereo \
+                  -map 0:v -map 1:a -c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -b:v "$VB" -maxrate "$VB" -bufsize "$BUF" -g "$GOP" -keyint_min "$GOP" -sc_threshold 0 -force_key_frames "expr:gte(t,n_forced*2)" \
+                  -c:a aac -b:a 128k -ar 44100 -ac 2 "${HLS_ARGS[@]}" >> stream.log 2>&1 &
+            fi
+            FEEDER_PID=$!
+            FEEDER_MODE="slate"
+            echo "$FEEDER_PID" > feeder.pid
+        }
+
+        build_source_headers() {
+            HEADERS=()
+            [ -n "$UA" ] && HEADERS+=("--http-header" "User-Agent=$UA")
+            [ -n "$REF" ] && HEADERS+=("--http-header" "Referer=$REF")
+            [ -n "$ORG" ] && HEADERS+=("--http-header" "Origin=$ORG")
+            FF_HEADERS=$(printf "User-Agent: %s\r\nReferer: %s\r\nOrigin: %s\r\n" "$UA" "$REF" "$ORG")
+        }
+
+        probe_source() {
+            local source_url="$1"
+            build_source_headers
+            local stream_test
+            stream_test=$(timeout --foreground --signal=INT --kill-after=3s 20s streamlink --stream-url "${HEADERS[@]}" "$source_url" best 2>/dev/null || true)
+            if [ -n "$stream_test" ]; then return 0; fi
+            timeout --foreground --signal=INT --kill-after=3s 15s ffprobe -hide_banner -loglevel error -headers "$FF_HEADERS" -rw_timeout 5000000 -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 -i "$source_url" >/dev/null 2>&1
+        }
+
+        start_live_feeder() {
+            local source_url="$1"
+            stop_feeder
+            prepare_hls_args
+            build_source_headers
+            echo "[SOURCE] Starting a new normalized TS feeder; RTMP publisher PID remains unchanged." >> stream.log
+            local stream_test
+            stream_test=$(timeout --foreground --signal=INT --kill-after=3s 20s streamlink --stream-url "${HEADERS[@]}" "$source_url" best 2>/dev/null || true)
+            if [ -n "$stream_test" ]; then
+                if [ -f logo.png ]; then
+                    streamlink --loglevel warning --stdout --default-stream best --retry-streams 5 --retry-max 6 --retry-open 3 --stream-segment-attempts 6 --stream-segment-timeout 20 --stream-timeout 50 --stream-segmented-queue-deadline 9 "${HEADERS[@]}" --hls-live-restart "$source_url" | \
+                    ffmpeg -hide_banner -loglevel warning -thread_queue_size 10240 -i pipe:0 "${AUDIO_INPUT[@]}" -i logo.png \
+                    -filter_complex "[0:v]scale=$FILTER_SCALE,fps=$FPS,format=yuv420p[bg];[${LOGO_INDEX}:v]scale=480:-1:force_original_aspect_ratio=decrease[logo];[bg][logo]overlay=24:24[outv]${AUDIO_FILTER:+;$AUDIO_FILTER}" \
+                    -map "[outv]" "${AUDIO_MAP[@]}" -c:v libx264 -preset superfast -tune zerolatency -pix_fmt yuv420p -b:v "$VB" -maxrate "$VB" -bufsize "$BUF" \
+                    -g "$GOP" -keyint_min "$GOP" -sc_threshold 0 -force_key_frames "expr:gte(t,n_forced*2)" -c:a aac -b:a 128k -ar 44100 -ac 2 "${HLS_ARGS[@]}" >> stream.log 2>&1 &
+                else
+                    streamlink --loglevel warning --stdout --default-stream best --retry-streams 5 --retry-max 6 --retry-open 3 --stream-segment-attempts 6 --stream-segment-timeout 20 --stream-timeout 50 --stream-segmented-queue-deadline 9 "${HEADERS[@]}" --hls-live-restart "$source_url" | \
+                    ffmpeg -hide_banner -loglevel warning -thread_queue_size 10240 -i pipe:0 "${AUDIO_INPUT[@]}" \
+                    -filter_complex "[0:v]scale=$FILTER_SCALE,fps=$FPS,format=yuv420p[outv]${AUDIO_FILTER:+;$AUDIO_FILTER}" -map "[outv]" "${AUDIO_MAP[@]}" \
+                    -c:v libx264 -preset superfast -tune zerolatency -pix_fmt yuv420p -b:v "$VB" -maxrate "$VB" -bufsize "$BUF" \
+                    -g "$GOP" -keyint_min "$GOP" -sc_threshold 0 -force_key_frames "expr:gte(t,n_forced*2)" -c:a aac -b:a 128k -ar 44100 -ac 2 "${HLS_ARGS[@]}" >> stream.log 2>&1 &
+                fi
+            else
+                echo "[SOURCE] Streamlink cannot open the URL; trying FFmpeg direct input." >> stream.log
+                if [ -f logo.png ]; then
+                    ffmpeg -hide_banner -loglevel warning -rw_timeout 30000000 -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 10 -reconnect_on_network_error 1 -reconnect_on_http_error 4xx,5xx -headers "$FF_HEADERS" -thread_queue_size 10240 -i "$source_url" "${AUDIO_INPUT[@]}" -i logo.png \
+                    -filter_complex "[0:v]scale=$FILTER_SCALE,fps=$FPS,format=yuv420p[bg];[${LOGO_INDEX}:v]scale=480:-1:force_original_aspect_ratio=decrease[logo];[bg][logo]overlay=24:24[outv]${AUDIO_FILTER:+;$AUDIO_FILTER}" -map "[outv]" "${AUDIO_MAP[@]}" \
+                    -c:v libx264 -preset superfast -tune zerolatency -pix_fmt yuv420p -b:v "$VB" -maxrate "$VB" -bufsize "$BUF" -g "$GOP" -keyint_min "$GOP" -sc_threshold 0 -force_key_frames "expr:gte(t,n_forced*2)" \
+                    -c:a aac -b:a 128k -ar 44100 -ac 2 "${HLS_ARGS[@]}" >> stream.log 2>&1 &
+                else
+                    ffmpeg -hide_banner -loglevel warning -rw_timeout 30000000 -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 10 -reconnect_on_network_error 1 -reconnect_on_http_error 4xx,5xx -headers "$FF_HEADERS" -thread_queue_size 10240 -i "$source_url" "${AUDIO_INPUT[@]}" \
+                    -filter_complex "[0:v]scale=$FILTER_SCALE,fps=$FPS,format=yuv420p[outv]${AUDIO_FILTER:+;$AUDIO_FILTER}" -map "[outv]" "${AUDIO_MAP[@]}" \
+                    -c:v libx264 -preset superfast -tune zerolatency -pix_fmt yuv420p -b:v "$VB" -maxrate "$VB" -bufsize "$BUF" -g "$GOP" -keyint_min "$GOP" -sc_threshold 0 -force_key_frames "expr:gte(t,n_forced*2)" \
+                    -c:a aac -b:a 128k -ar 44100 -ac 2 "${HLS_ARGS[@]}" >> stream.log 2>&1 &
+                fi
+            fi
+            FEEDER_PID=$!
+            FEEDER_MODE="live"
+            ACTIVE_SOURCE="$source_url"
+            echo "$FEEDER_PID" > feeder.pid
+        }
+
+        start_rtmp_publisher() {
+            if [ -z "$DEST_URL" ]; then
+                echo "[RTMP][FATAL] DEST_URL is empty; P90_DEST_URL Actions secret is missing." >> stream.log
+                return 1
+            fi
+            echo "[RTMP] Opening the single persistent FFmpeg publisher from the live TS playlist." >> stream.log
+            # Re-encode at the RTMP boundary so HLS timestamp/discontinuity changes never
+            # produce a silent or rejected FLV stream on the destination platform.
+            ffmpeg -hide_banner -loglevel warning -fflags +genpts+discardcorrupt -thread_queue_size 4096 \
+              -f hls -live_start_index -3 -i "$HLS_PLAYLIST" \
+              -map 0:v:0 -map 0:a:0? -c:v libx264 -preset veryfast -tune zerolatency \
+              -pix_fmt yuv420p -r "$FPS" -b:v "$VB" -maxrate "$VB" -bufsize "$BUF" \
+              -g "$GOP" -keyint_min "$GOP" -sc_threshold 0 -force_key_frames "expr:gte(t,n_forced*2)" \
+              -c:a aac -b:a 128k -ar 44100 -ac 2 -flvflags no_duration_filesize \
+              -f flv "$DEST_URL" >> stream.log 2>&1 &
+            PUBLISHER_PID=$!
+            echo "$PUBLISHER_PID" > publisher.pid
+            NEXT_PUBLISHER_RETRY=$(($(date +%s) + 5))
+        }
+
+        # Start slate first so the RTMP sink never waits for the first source to become available.
+        start_slate_feeder
+        for WAIT_I in $(seq 1 25); do
+            if [ -s "$HLS_PLAYLIST" ] && grep -q "#EXTINF" "$HLS_PLAYLIST"; then break; fi
+            sleep 1
+        done
+        if [ ! -s "$HLS_PLAYLIST" ] || ! grep -q "#EXTINF" "$HLS_PLAYLIST"; then
+            echo "[FATAL] Could not initialize the local HLS slate playlist." >> stream.log
+            exit 1
+        fi
+        start_rtmp_publisher
+
+        # The publisher is not restarted for input updates. Only the HLS feeder is replaced.
+        while true; do
+            if [ -f worker_exit.flag ]; then break; fi
+            NOW=$(date +%s)
+            SOURCE=$(cat current_source.txt 2>/dev/null)
+
+            if [ -n "$SOURCE" ] && [ "$SOURCE" != "$ACTIVE_SOURCE" ]; then
+                echo "[SOURCE] URL changed; switching feed to logo slate before validating the new URL." >> stream.log
+                start_slate_feeder
+                ACTIVE_SOURCE="$SOURCE"
+                NEXT_SOURCE_PROBE=0
+            fi
+
+            if [ "$FEEDER_MODE" = "live" ] && [ -n "$FEEDER_PID" ] && ! process_is_running "$FEEDER_PID"; then
+                wait "$FEEDER_PID" 2>/dev/null || true
+                FEEDER_PID=""
+                FEEDER_MODE=""
+                rm -f feeder.pid
+                echo "[SOURCE] Live feeder ended; keeping RTMP publisher open on the slate." >> stream.log
+                start_slate_feeder
+                NEXT_SOURCE_PROBE=0
+            fi
+
+            if [ -n "$SOURCE" ] && [ "$FEEDER_MODE" = "slate" ] && [ "$NOW" -ge "$NEXT_SOURCE_PROBE" ]; then
+                if probe_source "$SOURCE"; then
+                    echo "[SOURCE] New source is playable; replacing slate segments with live segments." >> stream.log
+                    start_live_feeder "$SOURCE"
+                    NEXT_SOURCE_PROBE=0
+                else
+                    echo "[SOURCE] Source is not ready; black/logo segments continue. Retrying shortly." >> stream.log
+                    NEXT_SOURCE_PROBE=$((NOW + 8))
+                fi
+            fi
+
+            if [ -n "$SOURCE" ] && [ "$FEEDER_MODE" = "" ]; then
+                start_slate_feeder
+                NEXT_SOURCE_PROBE=0
+            fi
+
+            if [ -n "$PUBLISHER_PID" ] && ! process_is_running "$PUBLISHER_PID" && [ "$NOW" -ge "$NEXT_PUBLISHER_RETRY" ]; then
+                wait "$PUBLISHER_PID" 2>/dev/null || true
+                echo "[RTMP] Publisher exited; reconnecting from the current live playlist." >> stream.log
+                start_rtmp_publisher
+            fi
+            sleep 2
+        done
+
+        stop_feeder
+        if [ -n "$PUBLISHER_PID" ]; then
+            kill -TERM "$PUBLISHER_PID" 2>/dev/null || true
+            wait "$PUBLISHER_PID" 2>/dev/null || true
+        fi
+        rm -f publisher.pid feeder.pid
+
+    
